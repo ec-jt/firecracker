@@ -228,6 +228,7 @@ impl ParsedRequest {
                 VmmData::MemoryMappings(mappings) => Self::success_response_with_data(mappings),
                 VmmData::Memory(meminfo) => Self::success_response_with_data(meminfo),
                 VmmData::MemoryDirty(dirty) => Self::success_response_with_data(dirty),
+                VmmData::DriveDirtyBitmap(dirty) => Self::success_response_with_data(dirty),
             },
             Err(vmm_action_error) => {
                 let mut response = match vmm_action_error {

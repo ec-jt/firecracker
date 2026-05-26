@@ -52,6 +52,28 @@ impl Block {
         }
     }
 
+    /// Get dirty block bitmap, optionally resetting it.
+    /// Only supported for Virtio block devices (not vhost-user).
+    pub fn get_dirty_bitmap(&self, reset: bool) -> crate::vmm_config::meminfo::DriveDirty {
+        use crate::vmm_config::meminfo::DriveDirty;
+        match self {
+            Self::Virtio(b) => {
+                if let Some(ref dirty) = b.disk.dirty_bitmap {
+                    let (bitmap, dirty_count) = dirty.get_and_reset(reset);
+                    DriveDirty {
+                        bitmap,
+                        block_size: dirty.block_size(),
+                        total_blocks: dirty.total_blocks(),
+                        dirty_count,
+                    }
+                } else {
+                    DriveDirty::default()
+                }
+            }
+            Self::VhostUser(_) => DriveDirty::default(),
+        }
+    }
+
     pub fn update_disk_image(&mut self, disk_image_path: String) -> Result<(), BlockError> {
         match self {
             Self::Virtio(b) => b

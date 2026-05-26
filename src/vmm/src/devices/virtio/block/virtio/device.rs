@@ -66,6 +66,7 @@ pub struct DiskProperties {
 }
 
 /// Thread-safe dirty block bitmap for tracking writes to a block device.
+#[derive(Debug)]
 pub struct DirtyBitmap {
     bitmap: Vec<std::sync::atomic::AtomicU64>,
     block_size: u64,
