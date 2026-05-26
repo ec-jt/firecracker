@@ -157,12 +157,20 @@ impl DiskProperties {
         let disk_size = Self::file_size(&disk_image_path, &mut disk_image)?;
         let image_id = Self::build_disk_image_id(&disk_image);
 
+        // Enable dirty tracking for writable drives (4KB block size)
+        let dirty_bitmap = if !is_disk_read_only && disk_size > 0 {
+            Some(Arc::new(DirtyBitmap::new(disk_size, 4096)))
+        } else {
+            None
+        };
+
         Ok(Self {
             file_path: disk_image_path,
             file_engine: FileEngine::from_file(disk_image, file_engine_type)
                 .map_err(VirtioBlockError::FileEngine)?,
             nsectors: disk_size >> SECTOR_SHIFT,
             image_id,
+            dirty_bitmap,
         })
     }
 

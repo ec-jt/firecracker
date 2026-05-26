@@ -1025,13 +1025,9 @@ impl RuntimeApiController {
         let start_us = get_time_us(ClockType::Monotonic);
         let vmm = self.vmm.lock().expect("Poisoned lock");
 
-        // Find the block device by drive_id
         let dirty_bitmap = vmm
-            .device_manager
             .get_block_dirty_bitmap(drive_id, reset)
-            .map_err(|e| VmmActionError::DriveConfig(DriveError::DeviceUpdate(
-                crate::devices::virtio::block::BlockError::UpdateNotAllowed(e),
-            )))?;
+            .map_err(VmmActionError::InternalVmm)?;
 
         let elapsed_time_us = get_time_us(ClockType::Monotonic) - start_us;
         info!("'get drive dirty' VMM action for '{drive_id}' took {elapsed_time_us} us (reset={reset}).");

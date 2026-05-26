@@ -525,6 +525,43 @@ impl Vmm {
         Ok(cpu_configs)
     }
 
+    /// Get dirty block bitmap for a drive, optionally resetting it.
+    pub fn get_block_dirty_bitmap(
+        &self,
+        drive_id: &str,
+        reset: bool,
+    ) -> Result<crate::vmm_config::meminfo::DriveDirty, VmmError> {
+        use crate::devices::virtio::block::Block;
+        use crate::vmm_config::meminfo::DriveDirty;
+
+        let device = self.device_manager
+            .get_virtio_device(
+                crate::devices::virtio::VirtioDeviceType::Block,
+                drive_id,
+            )
+            .ok_or_else(|| VmmError::DeviceManager(
+                crate::device_manager::DeviceManagerError::InvalidDeviceId(drive_id.to_string()),
+            ))?;
+
+        let locked_device = device.lock().expect("Poisoned lock");
+        let block = locked_device.as_any().downcast_ref::<Block>()
+            .ok_or_else(|| VmmError::DeviceManager(
+                crate::device_manager::DeviceManagerError::InvalidDeviceId(drive_id.to_string()),
+            ))?;
+
+        if let Some(ref dirty) = block.disk.dirty_bitmap {
+            let (bitmap, dirty_count) = dirty.get_and_reset(reset);
+            Ok(DriveDirty {
+                bitmap,
+                block_size: dirty.block_size(),
+                total_blocks: dirty.total_blocks(),
+                dirty_count,
+            })
+        } else {
+            Ok(DriveDirty::default())
+        }
+    }
+
     /// Updates the path of the host file backing the emulated block device with id `drive_id`.
     /// We update the disk image on the device and its virtio configuration.
     pub fn update_block_device_path(

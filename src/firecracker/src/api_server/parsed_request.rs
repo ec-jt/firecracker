@@ -93,6 +93,33 @@ impl TryFrom<&Request> for ParsedRequest {
                 parse_get_memory_hotplug()
             }
             (Method::Get, "memory", None) => parse_get_memory(path_tokens),
+            (Method::Get, "drives", None) => {
+                // GET /drives/{drive_id}/dirty or /drives/{drive_id}/dirty/reset
+                match path_tokens.next() {
+                    Some(drive_id) => match path_tokens.next() {
+                        Some("dirty") => match path_tokens.next() {
+                            Some("reset") => Ok(ParsedRequest::new_sync(
+                                VmmAction::GetAndResetDriveDirty(drive_id.to_string()),
+                            )),
+                            None => Ok(ParsedRequest::new_sync(
+                                VmmAction::GetDriveDirty(drive_id.to_string()),
+                            )),
+                            _ => Err(RequestError::InvalidPathMethod(
+                                format!("/drives/{drive_id}/dirty/..."),
+                                Method::Get,
+                            )),
+                        },
+                        _ => Err(RequestError::InvalidPathMethod(
+                            format!("/drives/{drive_id}"),
+                            Method::Get,
+                        )),
+                    },
+                    None => Err(RequestError::InvalidPathMethod(
+                        "/drives".to_string(),
+                        Method::Get,
+                    )),
+                }
+            }
             (Method::Get, _, Some(_)) => method_to_error(Method::Get),
             (Method::Put, "actions", Some(body)) => parse_put_actions(body),
             (Method::Put, "balloon", Some(body)) => parse_put_balloon(body),
