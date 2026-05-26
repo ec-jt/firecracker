@@ -59,6 +59,63 @@ pub struct DiskProperties {
     pub file_engine: FileEngine,
     pub nsectors: u64,
     pub image_id: [u8; VIRTIO_BLK_ID_BYTES as usize],
+    /// Dirty block bitmap — tracks which blocks have been written to.
+    /// Each bit represents one `dirty_block_size` block.
+    /// Set atomically on every write. Cleared on reset.
+    pub dirty_bitmap: Option<Arc<DirtyBitmap>>,
+}
+
+/// Thread-safe dirty block bitmap for tracking writes to a block device.
+pub struct DirtyBitmap {
+    bitmap: Vec<std::sync::atomic::AtomicU64>,
+    block_size: u64,
+    total_blocks: u64,
+}
+
+impl DirtyBitmap {
+    pub fn new(disk_size: u64, block_size: u64) -> Self {
+        let total_blocks = (disk_size + block_size - 1) / block_size;
+        let num_words = ((total_blocks + 63) / 64) as usize;
+        let bitmap: Vec<std::sync::atomic::AtomicU64> =
+            (0..num_words).map(|_| std::sync::atomic::AtomicU64::new(0)).collect();
+        Self { bitmap, block_size, total_blocks }
+    }
+
+    /// Mark blocks as dirty for a write at the given byte offset and length.
+    pub fn track_write(&self, offset: u64, len: u64) {
+        use std::sync::atomic::Ordering;
+        if len == 0 { return; }
+        let start_block = offset / self.block_size;
+        let end_block = (offset + len - 1) / self.block_size;
+        for block in start_block..=end_block {
+            if block >= self.total_blocks { break; }
+            let word = (block / 64) as usize;
+            let bit = block % 64;
+            if word < self.bitmap.len() {
+                self.bitmap[word].fetch_or(1 << bit, Ordering::Relaxed);
+            }
+        }
+    }
+
+    /// Get the dirty bitmap as a Vec<u64> and optionally reset it.
+    pub fn get_and_reset(&self, reset: bool) -> (Vec<u64>, u64) {
+        use std::sync::atomic::Ordering;
+        let mut result = Vec::with_capacity(self.bitmap.len());
+        let mut dirty_count = 0u64;
+        for word in &self.bitmap {
+            let val = if reset {
+                word.swap(0, Ordering::Relaxed)
+            } else {
+                word.load(Ordering::Relaxed)
+            };
+            dirty_count += val.count_ones() as u64;
+            result.push(val);
+        }
+        (result, dirty_count)
+    }
+
+    pub fn block_size(&self) -> u64 { self.block_size }
+    pub fn total_blocks(&self) -> u64 { self.total_blocks }
 }
 
 impl DiskProperties {

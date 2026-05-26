@@ -30,7 +30,7 @@ use crate::vmm_config::drive::{BlockDeviceConfig, BlockDeviceUpdateConfig, Drive
 use crate::vmm_config::entropy::{EntropyDeviceConfig, EntropyDeviceError};
 use crate::vmm_config::instance_info::{InstanceInfo, VmState};
 use crate::vmm_config::machine_config::{MachineConfig, MachineConfigError, MachineConfigUpdate};
-use crate::vmm_config::meminfo::{MemoryDirty, MemoryMapingsResponse, MemoryResponse};
+use crate::vmm_config::meminfo::{DriveDirty, MemoryDirty, MemoryMapingsResponse, MemoryResponse};
 use crate::vmm_config::memory_hotplug::{
     MemoryHotplugConfig, MemoryHotplugConfigError, MemoryHotplugSizeUpdate,
 };
@@ -153,6 +153,10 @@ pub enum VmmAction {
     GetMemory,
     /// Get guest memory dirty pages information
     GetMemoryDirty,
+    /// Get dirty block bitmap for a drive.
+    GetDriveDirty(String),
+    /// Get dirty block bitmap for a drive and reset it.
+    GetAndResetDriveDirty(String),
 }
 
 /// Wrapper for all errors associated with VMM actions.
@@ -243,6 +247,8 @@ pub enum VmmData {
     Memory(MemoryResponse),
     /// The guest memory dirty pages information
     MemoryDirty(MemoryDirty),
+    /// Drive dirty block bitmap
+    DriveDirtyBitmap(DriveDirty),
 }
 
 /// Trait used for deduplicating the MMDS request handling across the two ApiControllers.
@@ -513,7 +519,9 @@ impl<'a> PrebootApiController<'a> {
             | StopFreePageHinting
             | GetMemoryMappings
             | GetMemory
-            | GetMemoryDirty => Err(VmmActionError::OperationNotSupportedPreBoot),
+            | GetMemoryDirty
+            | GetDriveDirty(_)
+            | GetAndResetDriveDirty(_) => Err(VmmActionError::OperationNotSupportedPreBoot),
             #[cfg(target_arch = "x86_64")]
             SendCtrlAltDel => Err(VmmActionError::OperationNotSupportedPreBoot),
         }
@@ -792,6 +800,8 @@ impl RuntimeApiController {
             GetMemoryMappings => self.get_guest_memory_mappings(),
             GetMemory => self.get_guest_memory_info(),
             GetMemoryDirty => self.get_dirty_memory_info(),
+            GetDriveDirty(drive_id) => self.get_drive_dirty(&drive_id, false),
+            GetAndResetDriveDirty(drive_id) => self.get_drive_dirty(&drive_id, true),
             // Operations not allowed post-boot.
             ConfigureBootSource(_)
             | ConfigureLogger(_)
@@ -1008,6 +1018,25 @@ impl RuntimeApiController {
         info!("'get dirty memory' VMM action took {elapsed_time_us} us.");
 
         Ok(VmmData::MemoryDirty(MemoryDirty { bitmap }))
+    }
+
+    /// Get dirty block bitmap for a drive, optionally resetting it.
+    fn get_drive_dirty(&self, drive_id: &str, reset: bool) -> Result<VmmData, VmmActionError> {
+        let start_us = get_time_us(ClockType::Monotonic);
+        let vmm = self.vmm.lock().expect("Poisoned lock");
+
+        // Find the block device by drive_id
+        let dirty_bitmap = vmm
+            .device_manager
+            .get_block_dirty_bitmap(drive_id, reset)
+            .map_err(|e| VmmActionError::DriveConfig(DriveError::DeviceUpdate(
+                crate::devices::virtio::block::BlockError::UpdateNotAllowed(e),
+            )))?;
+
+        let elapsed_time_us = get_time_us(ClockType::Monotonic) - start_us;
+        info!("'get drive dirty' VMM action for '{drive_id}' took {elapsed_time_us} us (reset={reset}).");
+
+        Ok(VmmData::DriveDirtyBitmap(dirty_bitmap))
     }
 }
 

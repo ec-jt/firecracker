@@ -379,6 +379,10 @@ impl Request {
             }
             RequestType::Out => {
                 let _metric = block_metrics.write_agg.record_latency_metrics();
+                // Track dirty blocks before submitting write
+                if let Some(ref dirty) = disk.dirty_bitmap {
+                    dirty.track_write(self.offset(), u64::from(self.data_len));
+                }
                 disk.file_engine
                     .write(self.offset(), mem, self.data_addr, self.data_len, pending)
             }

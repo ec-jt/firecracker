@@ -27,3 +27,16 @@ pub struct MemoryDirty {
     /// Each bit represents whether a page has been written since the last snapshot.
     pub bitmap: Vec<u64>,
 }
+
+/// Information about dirty blocks on a block device
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize)]
+pub struct DriveDirty {
+    /// Bitmap for dirty blocks. Each bit represents one block_size block.
+    pub bitmap: Vec<u64>,
+    /// Block size in bytes (typically 4096)
+    pub block_size: u64,
+    /// Total number of blocks
+    pub total_blocks: u64,
+    /// Number of dirty blocks
+    pub dirty_count: u64,
+}
