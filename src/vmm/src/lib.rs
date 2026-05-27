@@ -870,6 +870,74 @@ impl Vmm {
 
         Ok(dirty_bitmap)
     }
+
+    /// Get true guest writes: KVM dirty log ∩ UFFD pagemap dirty.
+    ///
+    /// Combines two tracking mechanisms:
+    /// - **KVM dirty log** (`get_dirty_log`): tracks ALL page table modifications
+    ///   since last call.  Atomic get-and-clear at host page size (4KB).
+    ///   Includes both UFFD faults and guest writes.
+    /// - **UFFD pagemap** (bit 57): tracks write-protection status.
+    ///   WP cleared = page was written by guest.  Cumulative (no reset).
+    ///
+    /// The intersection `KVM_dirty AND NOT WP_set` gives exactly the pages
+    /// that were written by the guest since the last call — excluding UFFD
+    /// demand-faults which are KVM-dirty but still WP-protected.
+    ///
+    /// Returns bitmap at host page size (4KB) granularity.
+    /// Must be called while VM is paused.
+    pub fn get_kvm_dirty_writes(&self) -> Result<Vec<u64>, VmmError> {
+        let host_ps = crate::arch::host_page_size();
+        let pagemap = utils::pagemap::PagemapReader::new(host_ps)?;
+
+        // Step 1: KVM dirty log — atomic get-and-clear
+        let kvm_dirty = self.vm.get_dirty_bitmap(host_ps)
+            .map_err(VmmError::Vm)?;
+
+        // Flatten KVM dirty map (HashMap<slot, Vec<u64>>) into ordered Vec
+        let mut kvm_slots: Vec<_> = kvm_dirty.into_iter().collect();
+        kvm_slots.sort_by_key(|(slot_id, _)| *slot_id);
+
+        // Step 2: For each page, check KVM dirty AND pagemap dirty (NOT WP)
+        let mut result_bitmap = vec![];
+        let mut kvm_iter = kvm_slots.into_iter();
+        let mut kvm_current = kvm_iter.next();
+
+        for mem_slot in self
+            .vm
+            .guest_memory()
+            .iter()
+            .flat_map(|region| region.plugged_slots())
+        {
+            let base_addr = mem_slot.slice.ptr_guard_mut().as_ptr() as usize;
+            let len = mem_slot.slice.len();
+            let nr_pages = len / host_ps;
+
+            // Get KVM bitmap for this slot
+            let kvm_bm = if let Some((_, ref bm)) = kvm_current {
+                bm.clone()
+            } else {
+                vec![0u64; nr_pages.div_ceil(64)]
+            };
+            kvm_current = kvm_iter.next();
+
+            let mut slot_bitmap = vec![0u64; nr_pages.div_ceil(64)];
+            for page_idx in 0..nr_pages {
+                let kvm_dirty_bit =
+                    (kvm_bm[page_idx / 64] & (1u64 << (page_idx % 64))) != 0;
+                if kvm_dirty_bit {
+                    // Check pagemap: present AND WP cleared = written by guest
+                    let virt_addr = base_addr + (page_idx * host_ps);
+                    if pagemap.is_page_dirty(virt_addr).unwrap_or(false) {
+                        slot_bitmap[page_idx / 64] |= 1u64 << (page_idx % 64);
+                    }
+                }
+            }
+            result_bitmap.extend_from_slice(&slot_bitmap);
+        }
+
+        Ok(result_bitmap)
+    }
 }
 
 /// Process the content of the MPIDR_EL1 register in order to be able to pass it to KVM

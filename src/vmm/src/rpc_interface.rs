@@ -157,6 +157,8 @@ pub enum VmmAction {
     ResetMemoryDirty,
     /// Get KVM dirty log (atomic get-and-clear, 4KB granularity)
     GetKvmDirty,
+    /// Get true guest writes: KVM dirty ∩ UFFD pagemap (no CRC32 needed)
+    GetKvmDirtyWrites,
     /// Get dirty block bitmap for a drive.
     GetDriveDirty(String),
     /// Get dirty block bitmap for a drive and reset it.
@@ -526,6 +528,7 @@ impl<'a> PrebootApiController<'a> {
             | GetMemoryDirty
             | ResetMemoryDirty
             | GetKvmDirty
+            | GetKvmDirtyWrites
             | GetDriveDirty(_)
             | GetAndResetDriveDirty(_) => Err(VmmActionError::OperationNotSupportedPreBoot),
             #[cfg(target_arch = "x86_64")]
@@ -808,6 +811,7 @@ impl RuntimeApiController {
             GetMemoryDirty => self.get_dirty_memory_info(),
             ResetMemoryDirty => self.reset_dirty_memory_info(),
             GetKvmDirty => self.get_kvm_dirty_log(),
+            GetKvmDirtyWrites => self.get_kvm_dirty_writes(),
             GetDriveDirty(drive_id) => self.get_drive_dirty(&drive_id, false),
             GetAndResetDriveDirty(drive_id) => self.get_drive_dirty(&drive_id, true),
             // Operations not allowed post-boot.
@@ -1078,6 +1082,32 @@ impl RuntimeApiController {
         info!(
             "'get kvm dirty log' VMM action took {elapsed_time_us} us \
              ({dirty_count} dirty pages at {page_size}B granularity)."
+        );
+
+        Ok(VmmData::MemoryDirty(MemoryDirty { bitmap }))
+    }
+
+    /// Get true guest writes: KVM dirty ∩ UFFD pagemap.
+    ///
+    /// Combines KVM dirty log (atomic get-and-clear, 4KB) with UFFD pagemap
+    /// (WP bit 57) to return only pages actually written by the guest.
+    /// Excludes UFFD demand-faults which are KVM-dirty but still WP-protected.
+    /// No CRC32 needed — the bitmap IS the exact per-checkpoint delta.
+    fn get_kvm_dirty_writes(&self) -> Result<VmmData, VmmActionError> {
+        let start_us = get_time_us(ClockType::Monotonic);
+        let vmm = self.vmm.lock().expect("Poisoned lock");
+
+        if vmm.instance_info.state != VmState::Paused {
+            return Err(VmmActionError::OperationNotSupportedWhileRunning);
+        }
+
+        let bitmap = vmm.get_kvm_dirty_writes()?;
+
+        let dirty_count: u64 = bitmap.iter().map(|w| w.count_ones() as u64).sum();
+        let elapsed_time_us = get_time_us(ClockType::Monotonic) - start_us;
+        info!(
+            "'get kvm dirty writes' VMM action took {elapsed_time_us} us \
+             ({dirty_count} true guest-write pages at 4KB granularity)."
         );
 
         Ok(VmmData::MemoryDirty(MemoryDirty { bitmap }))
