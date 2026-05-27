@@ -806,6 +806,7 @@ impl Vmm {
         // Then re-apply WP to all dirty pages via the Uffd handle
         if let Some(ref uffd) = self.uffd {
             let mut reset_count = 0u64;
+            let mut error_count = 0u64;
             let mut bitmap_offset = 0usize;
 
             for mem_slot in self
@@ -824,15 +825,31 @@ impl Vmm {
                         (dirty_bitmap[global_idx / 64] & (1u64 << (global_idx % 64))) != 0;
                     if is_dirty {
                         let page_addr = base_addr + (page_idx * page_size);
-                        // Re-apply write-protection — WP_ASYNC handles future writes
-                        let _ = uffd.write_protect(page_addr as *mut c_void, page_size);
-                        reset_count += 1;
+                        // Re-apply write-protection — WP_ASYNC handles future writes.
+                        // Errors are non-fatal (page may not be faulted yet).
+                        match uffd.write_protect(page_addr as *mut c_void, page_size) {
+                            Ok(()) => reset_count += 1,
+                            Err(e) => {
+                                if error_count < 5 {
+                                    warn!(
+                                        "reset_dirty_memory: write_protect failed at page {page_idx} \
+                                         (addr=0x{page_addr:x}, page_size={page_size}): {e}"
+                                    );
+                                }
+                                error_count += 1;
+                            }
+                        }
                     }
                 }
                 bitmap_offset += nr_pages;
             }
 
-            info!("reset_dirty_memory: re-protected {reset_count} pages (page_size={page_size})");
+            info!(
+                "reset_dirty_memory: re-protected {reset_count} pages, \
+                 {error_count} errors (page_size={page_size})"
+            );
+        } else {
+            warn!("reset_dirty_memory: no UFFD handle available, skipping WP reset");
         }
 
         Ok(dirty_bitmap)
