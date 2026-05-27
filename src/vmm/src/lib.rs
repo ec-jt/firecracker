@@ -789,25 +789,25 @@ impl Vmm {
         Ok((resident, empty))
     }
 
-    /// Re-apply write-protection to all dirty pages, resetting the dirty bitmap.
+    /// Re-apply write-protection to ALL memory regions, resetting the dirty bitmap.
     ///
     /// After this call, `get_dirty_memory()` will only return pages written
-    /// AFTER the reset.  Uses `Uffd::write_protect()` to re-protect each
-    /// dirty page.  FC's `WP_ASYNC` feature ensures the kernel handles
-    /// subsequent writes automatically (no handler notification).
+    /// AFTER the reset.  Uses `Uffd::write_protect()` on entire memory regions
+    /// (same approach as the initial WP setup in persist/mod.rs).
     ///
     /// Must be called while the VM is paused.
     pub fn reset_dirty_memory(&self, page_size: usize) -> Result<Vec<u64>, VmmError> {
-        use std::ffi::c_void;
-
         // First, get the current dirty bitmap
         let dirty_bitmap = self.get_dirty_memory(page_size)?;
 
-        // Then re-apply WP to all dirty pages via the Uffd handle
+        // Re-apply WP to entire memory regions (not per-page).
+        // This is the same approach used in persist/mod.rs during UFFD setup:
+        //   uffd.write_protect(mem_region.as_ptr().cast(), mem_region.size())
+        // Applying WP to the whole region is faster and avoids issues with
+        // individual pages that may not have been faulted yet.
         if let Some(ref uffd) = self.uffd {
-            let mut reset_count = 0u64;
+            let mut region_count = 0u64;
             let mut error_count = 0u64;
-            let mut bitmap_offset = 0usize;
 
             for mem_slot in self
                 .vm
@@ -815,37 +815,32 @@ impl Vmm {
                 .iter()
                 .flat_map(|region| region.plugged_slots())
             {
-                let base_addr = mem_slot.slice.ptr_guard_mut().as_ptr() as usize;
+                let addr = mem_slot.slice.ptr_guard_mut().as_ptr();
                 let len = mem_slot.slice.len();
-                let nr_pages = len / page_size;
-
-                for page_idx in 0..nr_pages {
-                    let global_idx = bitmap_offset + page_idx;
-                    let is_dirty =
-                        (dirty_bitmap[global_idx / 64] & (1u64 << (global_idx % 64))) != 0;
-                    if is_dirty {
-                        let page_addr = base_addr + (page_idx * page_size);
-                        // Re-apply write-protection — WP_ASYNC handles future writes.
-                        // Errors are non-fatal (page may not be faulted yet).
-                        match uffd.write_protect(page_addr as *mut c_void, page_size) {
-                            Ok(()) => reset_count += 1,
-                            Err(e) => {
-                                if error_count < 5 {
-                                    warn!(
-                                        "reset_dirty_memory: write_protect failed at page {page_idx} \
-                                         (addr=0x{page_addr:x}, page_size={page_size}): {e}"
-                                    );
-                                }
-                                error_count += 1;
-                            }
-                        }
+                match uffd.write_protect(addr.cast(), len) {
+                    Ok(()) => {
+                        region_count += 1;
+                        info!(
+                            "reset_dirty_memory: WP applied to region {region_count} \
+                             (addr=0x{:x}, len={}MB)",
+                            addr as usize,
+                            len / (1024 * 1024)
+                        );
+                    }
+                    Err(e) => {
+                        error_count += 1;
+                        error!(
+                            "reset_dirty_memory: write_protect failed for region \
+                             (addr=0x{:x}, len={}MB): {e}",
+                            addr as usize,
+                            len / (1024 * 1024)
+                        );
                     }
                 }
-                bitmap_offset += nr_pages;
             }
 
             info!(
-                "reset_dirty_memory: re-protected {reset_count} pages, \
+                "reset_dirty_memory: {region_count} regions re-protected, \
                  {error_count} errors (page_size={page_size})"
             );
         } else {
