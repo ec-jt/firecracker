@@ -789,6 +789,55 @@ impl Vmm {
         Ok((resident, empty))
     }
 
+    /// Re-apply write-protection to all dirty pages, resetting the dirty bitmap.
+    ///
+    /// After this call, `get_dirty_memory()` will only return pages written
+    /// AFTER the reset.  Uses `Uffd::write_protect()` to re-protect each
+    /// dirty page.  FC's `WP_ASYNC` feature ensures the kernel handles
+    /// subsequent writes automatically (no handler notification).
+    ///
+    /// Must be called while the VM is paused.
+    pub fn reset_dirty_memory(&self, page_size: usize) -> Result<Vec<u64>, VmmError> {
+        use std::ffi::c_void;
+
+        // First, get the current dirty bitmap
+        let dirty_bitmap = self.get_dirty_memory(page_size)?;
+
+        // Then re-apply WP to all dirty pages via the Uffd handle
+        if let Some(ref uffd) = self.uffd {
+            let mut reset_count = 0u64;
+            let mut bitmap_offset = 0usize;
+
+            for mem_slot in self
+                .vm
+                .guest_memory()
+                .iter()
+                .flat_map(|region| region.plugged_slots())
+            {
+                let base_addr = mem_slot.slice.ptr_guard_mut().as_ptr() as usize;
+                let len = mem_slot.slice.len();
+                let nr_pages = len / page_size;
+
+                for page_idx in 0..nr_pages {
+                    let global_idx = bitmap_offset + page_idx;
+                    let is_dirty =
+                        (dirty_bitmap[global_idx / 64] & (1u64 << (global_idx % 64))) != 0;
+                    if is_dirty {
+                        let page_addr = base_addr + (page_idx * page_size);
+                        // Re-apply write-protection — WP_ASYNC handles future writes
+                        let _ = uffd.write_protect(page_addr as *mut c_void, page_size);
+                        reset_count += 1;
+                    }
+                }
+                bitmap_offset += nr_pages;
+            }
+
+            info!("reset_dirty_memory: re-protected {reset_count} pages (page_size={page_size})");
+        }
+
+        Ok(dirty_bitmap)
+    }
+
     /// Get dirty pages bitmap for guest memory
     pub fn get_dirty_memory(&self, page_size: usize) -> Result<Vec<u64>, VmmError> {
         let pagemap = utils::pagemap::PagemapReader::new(page_size)?;

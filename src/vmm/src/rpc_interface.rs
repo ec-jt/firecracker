@@ -153,6 +153,8 @@ pub enum VmmAction {
     GetMemory,
     /// Get guest memory dirty pages information
     GetMemoryDirty,
+    /// Get + reset guest memory dirty pages (re-apply WP for incremental tracking)
+    ResetMemoryDirty,
     /// Get dirty block bitmap for a drive.
     GetDriveDirty(String),
     /// Get dirty block bitmap for a drive and reset it.
@@ -520,6 +522,7 @@ impl<'a> PrebootApiController<'a> {
             | GetMemoryMappings
             | GetMemory
             | GetMemoryDirty
+            | ResetMemoryDirty
             | GetDriveDirty(_)
             | GetAndResetDriveDirty(_) => Err(VmmActionError::OperationNotSupportedPreBoot),
             #[cfg(target_arch = "x86_64")]
@@ -800,6 +803,7 @@ impl RuntimeApiController {
             GetMemoryMappings => self.get_guest_memory_mappings(),
             GetMemory => self.get_guest_memory_info(),
             GetMemoryDirty => self.get_dirty_memory_info(),
+            ResetMemoryDirty => self.reset_dirty_memory_info(),
             GetDriveDirty(drive_id) => self.get_drive_dirty(&drive_id, false),
             GetAndResetDriveDirty(drive_id) => self.get_drive_dirty(&drive_id, true),
             // Operations not allowed post-boot.
@@ -1016,6 +1020,24 @@ impl RuntimeApiController {
 
         let elapsed_time_us = get_time_us(ClockType::Monotonic) - start_us;
         info!("'get dirty memory' VMM action took {elapsed_time_us} us.");
+
+        Ok(VmmData::MemoryDirty(MemoryDirty { bitmap }))
+    }
+
+    /// Get + reset dirty memory pages (re-apply write-protection for incremental tracking).
+    fn reset_dirty_memory_info(&self) -> Result<VmmData, VmmActionError> {
+        let start_us = get_time_us(ClockType::Monotonic);
+        let vmm = self.vmm.lock().expect("Poisoned lock");
+
+        if vmm.instance_info.state != VmState::Paused {
+            return Err(VmmActionError::OperationNotSupportedWhileRunning);
+        }
+
+        let page_size = self.vm_resources.machine_config.huge_pages.page_size();
+        let bitmap = vmm.reset_dirty_memory(page_size)?;
+
+        let elapsed_time_us = get_time_us(ClockType::Monotonic) - start_us;
+        info!("'reset dirty memory' VMM action took {elapsed_time_us} us.");
 
         Ok(VmmData::MemoryDirty(MemoryDirty { bitmap }))
     }
