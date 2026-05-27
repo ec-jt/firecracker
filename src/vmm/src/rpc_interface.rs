@@ -155,6 +155,8 @@ pub enum VmmAction {
     GetMemoryDirty,
     /// Get + reset guest memory dirty pages (re-apply WP for incremental tracking)
     ResetMemoryDirty,
+    /// Get KVM dirty log (atomic get-and-clear, 4KB granularity)
+    GetKvmDirty,
     /// Get dirty block bitmap for a drive.
     GetDriveDirty(String),
     /// Get dirty block bitmap for a drive and reset it.
@@ -523,6 +525,7 @@ impl<'a> PrebootApiController<'a> {
             | GetMemory
             | GetMemoryDirty
             | ResetMemoryDirty
+            | GetKvmDirty
             | GetDriveDirty(_)
             | GetAndResetDriveDirty(_) => Err(VmmActionError::OperationNotSupportedPreBoot),
             #[cfg(target_arch = "x86_64")]
@@ -804,6 +807,7 @@ impl RuntimeApiController {
             GetMemory => self.get_guest_memory_info(),
             GetMemoryDirty => self.get_dirty_memory_info(),
             ResetMemoryDirty => self.reset_dirty_memory_info(),
+            GetKvmDirty => self.get_kvm_dirty_log(),
             GetDriveDirty(drive_id) => self.get_drive_dirty(&drive_id, false),
             GetAndResetDriveDirty(drive_id) => self.get_drive_dirty(&drive_id, true),
             // Operations not allowed post-boot.
@@ -1038,6 +1042,43 @@ impl RuntimeApiController {
 
         let elapsed_time_us = get_time_us(ClockType::Monotonic) - start_us;
         info!("'reset dirty memory' VMM action took {elapsed_time_us} us.");
+
+        Ok(VmmData::MemoryDirty(MemoryDirty { bitmap }))
+    }
+
+    /// Get KVM dirty log — atomic get-and-clear at 4KB granularity.
+    ///
+    /// Uses KVM's `get_dirty_log` ioctl which atomically returns the dirty
+    /// bitmap AND clears it.  This is the standard approach for incremental
+    /// memory tracking in KVM (used for live migration).
+    ///
+    /// Returns a flat bitmap at host page size (4KB) granularity.
+    /// Each bit represents one 4KB page.
+    fn get_kvm_dirty_log(&self) -> Result<VmmData, VmmActionError> {
+        let start_us = get_time_us(ClockType::Monotonic);
+        let vmm = self.vmm.lock().expect("Poisoned lock");
+
+        if vmm.instance_info.state != VmState::Paused {
+            return Err(VmmActionError::OperationNotSupportedWhileRunning);
+        }
+
+        let page_size = crate::arch::host_page_size();
+        let dirty_map = vmm.vm.get_dirty_bitmap(page_size)
+            .map_err(|e| VmmActionError::InternalVmm(VmmError::Vm(e)))?;
+
+        // Flatten HashMap<slot_id, Vec<u64>> into a single Vec<u64>
+        // Slots are ordered by slot ID (ascending)
+        let mut slots: Vec<_> = dirty_map.into_iter().collect();
+        slots.sort_by_key(|(slot_id, _)| *slot_id);
+        let bitmap: Vec<u64> = slots.into_iter().flat_map(|(_, bm)| bm).collect();
+
+        let dirty_count: u64 = bitmap.iter().map(|w| w.count_ones() as u64).sum();
+
+        let elapsed_time_us = get_time_us(ClockType::Monotonic) - start_us;
+        info!(
+            "'get kvm dirty log' VMM action took {elapsed_time_us} us \
+             ({dirty_count} dirty pages at {page_size}B granularity)."
+        );
 
         Ok(VmmData::MemoryDirty(MemoryDirty { bitmap }))
     }
