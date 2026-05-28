@@ -159,6 +159,10 @@ pub enum VmmAction {
     GetKvmDirty,
     /// Get true guest writes: KVM dirty ∩ UFFD pagemap (no CRC32 needed)
     GetKvmDirtyWrites,
+    /// Initialize xxHash delta tracking from golden mem.snap
+    InitDeltaHashes(String),
+    /// Get dirty delta: xxHash dedup at 4KB granularity
+    GetDirtyDelta,
     /// Get dirty block bitmap for a drive.
     GetDriveDirty(String),
     /// Get dirty block bitmap for a drive and reset it.
@@ -529,8 +533,10 @@ impl<'a> PrebootApiController<'a> {
             | ResetMemoryDirty
             | GetKvmDirty
             | GetKvmDirtyWrites
+            | GetDirtyDelta
             | GetDriveDirty(_)
-            | GetAndResetDriveDirty(_) => Err(VmmActionError::OperationNotSupportedPreBoot),
+            | GetAndResetDriveDirty(_)
+            | InitDeltaHashes(_) => Err(VmmActionError::OperationNotSupportedPreBoot),
             #[cfg(target_arch = "x86_64")]
             SendCtrlAltDel => Err(VmmActionError::OperationNotSupportedPreBoot),
         }
@@ -812,6 +818,25 @@ impl RuntimeApiController {
             ResetMemoryDirty => self.reset_dirty_memory_info(),
             GetKvmDirty => self.get_kvm_dirty_log(),
             GetKvmDirtyWrites => self.get_kvm_dirty_writes(),
+            InitDeltaHashes(path) => {
+                let mut vmm = self.vmm.lock().expect("Poisoned lock");
+                vmm.init_delta_hashes(&path)
+                    .map_err(VmmActionError::InternalVmm)?;
+                Ok(VmmData::Empty)
+            }
+            GetDirtyDelta => {
+                let start_us = get_time_us(ClockType::Monotonic);
+                let mut vmm = self.vmm.lock().expect("Poisoned lock");
+                if vmm.instance_info.state != VmState::Paused {
+                    return Err(VmmActionError::OperationNotSupportedWhileRunning);
+                }
+                let page_size = vmm.page_size;
+                let bitmap = vmm.get_dirty_delta(page_size)?;
+                let changed: u64 = bitmap.iter().map(|w| w.count_ones() as u64).sum();
+                let elapsed = get_time_us(ClockType::Monotonic) - start_us;
+                info!("'get dirty delta' took {elapsed} us ({changed} changed 4KB blocks)");
+                Ok(VmmData::MemoryDirty(MemoryDirty { bitmap }))
+            }
             GetDriveDirty(drive_id) => self.get_drive_dirty(&drive_id, false),
             GetAndResetDriveDirty(drive_id) => self.get_drive_dirty(&drive_id, true),
             // Operations not allowed post-boot.

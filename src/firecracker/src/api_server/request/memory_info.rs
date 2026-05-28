@@ -19,6 +19,7 @@ where
         },
         Some("kvm-dirty") => Ok(ParsedRequest::new_sync(VmmAction::GetKvmDirty)),
         Some("kvm-dirty-writes") => Ok(ParsedRequest::new_sync(VmmAction::GetKvmDirtyWrites)),
+        Some("dirty-delta") => Ok(ParsedRequest::new_sync(VmmAction::GetDirtyDelta)),
         Some(unknown_path) => Err(RequestError::InvalidPathMethod(
             format!("/memory/{}", unknown_path),
             Method::Get,

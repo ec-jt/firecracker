@@ -122,6 +122,27 @@ impl TryFrom<&Request> for ParsedRequest {
             }
             (Method::Get, _, Some(_)) => method_to_error(Method::Get),
             (Method::Put, "actions", Some(body)) => parse_put_actions(body),
+            (Method::Put, "memory", Some(body)) => {
+                // PUT /memory/delta-hashes/init
+                match path_tokens.next() {
+                    Some("delta-hashes") => match path_tokens.next() {
+                        Some("init") => {
+                            let val: serde_json::Value = serde_json::from_slice(body.raw())?;
+                            let path = val.get("golden_mem_path")
+                                .and_then(|v| v.as_str())
+                                .ok_or_else(|| RequestError::InvalidPathMethod(
+                                    "/memory/delta-hashes/init: missing golden_mem_path".into(),
+                                    Method::Put,
+                                ))?;
+                            Ok(ParsedRequest::new_sync(
+                                VmmAction::InitDeltaHashes(path.to_string()),
+                            ))
+                        }
+                        _ => method_to_error(Method::Put),
+                    },
+                    _ => method_to_error(Method::Put),
+                }
+            }
             (Method::Put, "balloon", Some(body)) => parse_put_balloon(body),
             (Method::Put, "boot-source", Some(body)) => parse_put_boot_source(body),
             (Method::Put, "cpu-config", Some(body)) => parse_put_cpu_config(body),

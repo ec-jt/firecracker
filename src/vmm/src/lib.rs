@@ -260,6 +260,8 @@ pub enum VmmError {
     Pagemap(#[from] utils::pagemap::PagemapError),
     /// Failed to create memory hotplug device: {0}
     VirtioMem(#[from] VirtioMemError),
+    /// Internal error: {0}
+    InternalError(String),
 }
 
 /// Shorthand type for KVM dirty page bitmap.
@@ -319,6 +321,10 @@ pub struct Vmm {
     device_manager: DeviceManager,
     /// Page size used for backing guest memory
     pub page_size: usize,
+    /// Per-4KB-block xxh3 hashes for dirty delta tracking.
+    /// Initialized from golden mem.snap via PUT /memory/delta-hashes/init.
+    /// Updated on each GET /memory/dirty-delta call.
+    delta_hashes: Vec<u64>,
 }
 
 impl Vmm {
@@ -869,6 +875,123 @@ impl Vmm {
         }
 
         Ok(dirty_bitmap)
+    }
+
+    /// Initialize xxh3 delta hashes from golden mem.snap file.
+    ///
+    /// Mmaps the golden file read-only, computes xxh3_64 for each 4KB block,
+    /// stores hashes in `self.delta_hashes`.  Called once after UFFD snapshot
+    /// restore via `PUT /memory/delta-hashes/init`.
+    pub fn init_delta_hashes(&mut self, golden_path: &str) -> Result<(), VmmError> {
+        use std::os::unix::io::AsRawFd;
+        use xxhash_rust::xxh3::xxh3_64;
+
+        let file = std::fs::File::open(golden_path)
+            .map_err(|e| VmmError::InternalError(format!("open golden: {e}")))?;
+        let len = file.metadata()
+            .map_err(|e| VmmError::InternalError(format!("stat golden: {e}")))?
+            .len() as usize;
+
+        let ptr = unsafe {
+            libc::mmap(
+                std::ptr::null_mut(),
+                len,
+                libc::PROT_READ,
+                libc::MAP_SHARED | libc::MAP_POPULATE,
+                file.as_raw_fd(),
+                0,
+            )
+        };
+        if ptr == libc::MAP_FAILED {
+            return Err(VmmError::InternalError("mmap golden failed".into()));
+        }
+
+        let host_ps = crate::arch::host_page_size();
+        let num_blocks = len / host_ps;
+        let data = unsafe { std::slice::from_raw_parts(ptr as *const u8, len) };
+
+        let mut hashes = Vec::with_capacity(num_blocks);
+        for i in 0..num_blocks {
+            let block = &data[i * host_ps..(i + 1) * host_ps];
+            hashes.push(xxh3_64(block));
+        }
+
+        unsafe { libc::munmap(ptr, len); }
+
+        info!(
+            "init_delta_hashes: computed {} xxh3 hashes from {} ({}MB)",
+            num_blocks, golden_path, len / (1024 * 1024)
+        );
+        self.delta_hashes = hashes;
+        Ok(())
+    }
+
+    /// Get dirty delta: xxHash dedup at 4KB granularity.
+    ///
+    /// For each dirty 2MB hugepage (from UFFD pagemap), xxh3 each 4KB
+    /// sub-page and compare against stored hashes.  Returns bitmap of
+    /// only changed sub-pages.  Updates stored hashes for next call.
+    ///
+    /// Must be called while VM is paused.
+    pub fn get_dirty_delta(&mut self, page_size: usize) -> Result<Vec<u64>, VmmError> {
+        use xxhash_rust::xxh3::xxh3_64;
+
+        if self.delta_hashes.is_empty() {
+            return Err(VmmError::InternalError(
+                "delta_hashes not initialized — call init_delta_hashes first".into(),
+            ));
+        }
+
+        let host_ps = crate::arch::host_page_size();
+        let subs_per_page = page_size / host_ps;
+
+        // Step 1: Get UFFD dirty bitmap (2MB hugepage granularity)
+        let dirty_bitmap = self.get_dirty_memory(page_size)?;
+
+        // Step 2: For each dirty hugepage, xxh3 each 4KB sub-page
+        let mut delta_bitmap = vec![];
+        let mut global_sub_idx = 0usize;
+
+        for mem_slot in self
+            .vm
+            .guest_memory()
+            .iter()
+            .flat_map(|region| region.plugged_slots())
+        {
+            let base = mem_slot.slice.ptr_guard_mut().as_ptr() as *const u8;
+            let nr_pages = mem_slot.slice.len() / page_size;
+            let nr_subs = mem_slot.slice.len() / host_ps;
+            let mut sub_bitmap = vec![0u64; nr_subs.div_ceil(64)];
+
+            for page_idx in 0..nr_pages {
+                let is_dirty =
+                    (dirty_bitmap[page_idx / 64] & (1u64 << (page_idx % 64))) != 0;
+                if !is_dirty {
+                    global_sub_idx += subs_per_page;
+                    continue;
+                }
+
+                for sub in 0..subs_per_page {
+                    let sub_idx = page_idx * subs_per_page + sub;
+                    let offset = sub_idx * host_ps;
+                    let block = unsafe {
+                        std::slice::from_raw_parts(base.add(offset), host_ps)
+                    };
+                    let hash = xxh3_64(block);
+
+                    if global_sub_idx < self.delta_hashes.len()
+                        && hash != self.delta_hashes[global_sub_idx]
+                    {
+                        sub_bitmap[sub_idx / 64] |= 1u64 << (sub_idx % 64);
+                        self.delta_hashes[global_sub_idx] = hash;
+                    }
+                    global_sub_idx += 1;
+                }
+            }
+            delta_bitmap.extend_from_slice(&sub_bitmap);
+        }
+
+        Ok(delta_bitmap)
     }
 
     /// Get true guest writes: KVM dirty log ∩ UFFD pagemap dirty.
