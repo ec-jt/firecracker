@@ -819,23 +819,53 @@ impl RuntimeApiController {
             GetKvmDirty => self.get_kvm_dirty_log(),
             GetKvmDirtyWrites => self.get_kvm_dirty_writes(),
             InitDeltaHashes(path) => {
+                let start_us = get_time_us(ClockType::Monotonic);
                 let mut vmm = self.vmm.lock().expect("Poisoned lock");
-                vmm.init_delta_hashes(&path)
-                    .map_err(VmmActionError::InternalVmm)?;
-                Ok(VmmData::Empty)
+                match vmm.init_delta_hashes(&path) {
+                    Ok(()) => {
+                        let elapsed = get_time_us(ClockType::Monotonic) - start_us;
+                        let count = vmm.delta_hashes.len();
+                        info!(
+                            "'init delta hashes' took {elapsed} us \
+                             ({count} blocks from {path})"
+                        );
+                        Ok(VmmData::Empty)
+                    }
+                    Err(e) => {
+                        error!(
+                            "'init delta hashes' FAILED for {path}: {e:?}"
+                        );
+                        Err(VmmActionError::InternalVmm(e))
+                    }
+                }
             }
             GetDirtyDelta => {
                 let start_us = get_time_us(ClockType::Monotonic);
                 let mut vmm = self.vmm.lock().expect("Poisoned lock");
                 if vmm.instance_info.state != VmState::Paused {
+                    error!("'get dirty delta' called while VM is running");
                     return Err(VmmActionError::OperationNotSupportedWhileRunning);
                 }
                 let page_size = vmm.page_size;
-                let bitmap = vmm.get_dirty_delta(page_size)?;
-                let changed: u64 = bitmap.iter().map(|w| w.count_ones() as u64).sum();
-                let elapsed = get_time_us(ClockType::Monotonic) - start_us;
-                info!("'get dirty delta' took {elapsed} us ({changed} changed 4KB blocks)");
-                Ok(VmmData::MemoryDirty(MemoryDirty { bitmap }))
+                match vmm.get_dirty_delta(page_size) {
+                    Ok(bitmap) => {
+                        let changed: u64 =
+                            bitmap.iter().map(|w| w.count_ones() as u64).sum();
+                        let elapsed = get_time_us(ClockType::Monotonic) - start_us;
+                        info!(
+                            "'get dirty delta' took {elapsed} us \
+                             ({changed} changed 4KB blocks)"
+                        );
+                        Ok(VmmData::MemoryDirty(MemoryDirty { bitmap }))
+                    }
+                    Err(e) => {
+                        let elapsed = get_time_us(ClockType::Monotonic) - start_us;
+                        error!(
+                            "'get dirty delta' FAILED after {elapsed} us: {e:?}"
+                        );
+                        Err(VmmActionError::InternalVmm(e))
+                    }
+                }
             }
             GetDriveDirty(drive_id) => self.get_drive_dirty(&drive_id, false),
             GetAndResetDriveDirty(drive_id) => self.get_drive_dirty(&drive_id, true),
