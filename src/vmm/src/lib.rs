@@ -1206,7 +1206,7 @@ impl Vmm {
 
         // Step 5: Update prev_checkpoint_blocks for next P-frame.
         // Cap at 4096 blocks (16MB) — if exceeded, clear so next becomes I-frame.
-        const MAX_PREV_BLOCKS: usize = 4096;
+        const MAX_PREV_BLOCKS: usize = 32768; // 128MB — enough for heavy agent turns
         if new_prev_blocks.len() <= MAX_PREV_BLOCKS {
             self.prev_checkpoint_blocks = new_prev_blocks;
         } else {
