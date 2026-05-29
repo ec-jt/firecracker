@@ -1090,6 +1090,7 @@ impl Vmm {
                                 &golden_data[offset..offset + host_ps];
                             let mut xored = vec![0u8; host_ps];
                             // XOR in 8-byte chunks for performance
+                            let mut is_zero = true;
                             for i in (0..host_ps).step_by(8) {
                                 let d = u64::from_ne_bytes(
                                     block[i..i + 8].try_into().unwrap(),
@@ -1097,8 +1098,17 @@ impl Vmm {
                                 let g = u64::from_ne_bytes(
                                     golden_block[i..i + 8].try_into().unwrap(),
                                 );
+                                let x = d ^ g;
+                                if x != 0 { is_zero = false; }
                                 xored[i..i + 8]
-                                    .copy_from_slice(&(d ^ g).to_ne_bytes());
+                                    .copy_from_slice(&x.to_ne_bytes());
+                            }
+                            // Phase 6b: skip blocks identical to golden
+                            // (XOR result is all-zeros → block unchanged)
+                            if is_zero {
+                                self.delta_hashes[global_sub_idx] = hash;
+                                global_sub_idx += 1;
+                                continue;
                             }
                             block_data.extend_from_slice(&xored);
                         } else {
