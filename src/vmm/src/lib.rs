@@ -330,6 +330,12 @@ pub struct Vmm {
     /// Kept alive after init_delta_hashes() for use by get_dirty_delta_packed().
     /// (ptr, len) — raw mmap, PROT_READ, MAP_SHARED.
     golden_base: Option<(*const u8, usize)>,
+    /// Previous checkpoint's dirty block data for P-frame XOR.
+    /// Maps block_index → raw 4KB block data from the previous checkpoint.
+    /// Used as XOR base for P-frame checkpoints (XOR against previous instead
+    /// of golden).  Cleared on I-frame (keyframe) to reset memory.
+    /// Cap: 4096 blocks (16MB) — if exceeded, cleared and next becomes I-frame.
+    prev_checkpoint_blocks: HashMap<u32, Vec<u8>>,
 }
 
 // SAFETY: golden_base is a read-only mmap pointer that is only accessed
@@ -1014,9 +1020,14 @@ impl Vmm {
 
     /// Get dirty delta as XOR'd packed_v1 lz4 blob.
     ///
-    /// Combines get_dirty_delta() bitmap + block reads + XOR with golden base
-    /// + pack into packed_v1 format + lz4 compress — all in a single call.
-    /// Returns the compressed blob ready for S3 upload.
+    /// Combines get_dirty_delta() bitmap + block reads + XOR + pack + lz4
+    /// compress — all in a single call.  Returns the compressed blob ready
+    /// for S3 upload.
+    ///
+    /// **P-frame support**: If `prev_checkpoint_blocks` is non-empty, blocks
+    /// that exist in the previous checkpoint are XOR'd against the previous
+    /// data (P-frame) instead of golden (I-frame).  This produces mostly-zero
+    /// XOR results that lz4 compresses 20-100x better.
     ///
     /// Must be called while VM is paused.
     pub fn get_dirty_delta_packed(
@@ -1045,13 +1056,23 @@ impl Vmm {
         let host_ps = crate::arch::host_page_size(); // 4096
         let subs_per_page = page_size / host_ps;
 
+        // P-frame: if prev_checkpoint_blocks is non-empty, we have a previous
+        // checkpoint to XOR against.  Track whether any block used P-frame XOR.
+        let has_prev = !self.prev_checkpoint_blocks.is_empty();
+        let prev_block_count = self.prev_checkpoint_blocks.len();
+
         // Step 1: Get UFFD dirty bitmap (hugepage granularity)
         let dirty_bitmap = self.get_dirty_memory(page_size)?;
 
-        // Step 2: For each dirty block, read + xxHash dedup + XOR with golden
+        // Step 2: For each dirty block, read + xxHash dedup + XOR
         let mut indices: Vec<u32> = Vec::new();
         let mut block_data: Vec<u8> = Vec::new();
         let mut global_sub_idx = 0usize;
+        // Collect new prev blocks for next checkpoint's P-frame XOR.
+        // Stores RAW block data (before XOR) — the actual guest memory content.
+        let mut new_prev_blocks: HashMap<u32, Vec<u8>> = HashMap::new();
+        let mut p_frame_blocks = 0u32;
+        let mut i_frame_blocks = 0u32;
 
         for mem_slot in self
             .vm
@@ -1084,45 +1105,74 @@ impl Vmm {
                     if global_sub_idx < self.delta_hashes.len()
                         && hash != self.delta_hashes[global_sub_idx]
                     {
-                        // Changed block — XOR with golden base
-                        if offset + host_ps <= golden_len {
-                            let golden_block =
-                                &golden_data[offset..offset + host_ps];
-                            let mut xored = vec![0u8; host_ps];
-                            // XOR in 8-byte chunks for performance
-                            let mut is_zero = true;
-                            for i in (0..host_ps).step_by(8) {
-                                let d = u64::from_ne_bytes(
-                                    block[i..i + 8].try_into().unwrap(),
-                                );
-                                let g = u64::from_ne_bytes(
-                                    golden_block[i..i + 8].try_into().unwrap(),
-                                );
-                                let x = d ^ g;
-                                if x != 0 { is_zero = false; }
-                                xored[i..i + 8]
-                                    .copy_from_slice(&x.to_ne_bytes());
-                            }
-                            // Phase 6b: skip blocks identical to golden
-                            // (XOR result is all-zeros → block unchanged)
-                            if is_zero {
-                                self.delta_hashes[global_sub_idx] = hash;
-                                global_sub_idx += 1;
-                                continue;
-                            }
-                            block_data.extend_from_slice(&xored);
+                        // Determine XOR base: previous checkpoint (P-frame)
+                        // or golden (I-frame).
+                        let xor_base: &[u8] = if let Some(prev_data) =
+                            self.prev_checkpoint_blocks.get(&(sub_idx as u32))
+                        {
+                            // P-frame: XOR against previous checkpoint's data
+                            prev_data.as_slice()
+                        } else if offset + host_ps <= golden_len {
+                            // I-frame: XOR against golden base
+                            &golden_data[offset..offset + host_ps]
                         } else {
-                            // Block beyond golden range — store raw
-                            block_data.extend_from_slice(block);
+                            // Beyond golden range — store raw
+                            block
+                        };
+
+                        // XOR in 8-byte chunks for performance
+                        let mut xored = vec![0u8; host_ps];
+                        let mut is_zero = true;
+                        for i in (0..host_ps).step_by(8) {
+                            let d = u64::from_ne_bytes(
+                                block[i..i + 8].try_into().unwrap(),
+                            );
+                            let b = u64::from_ne_bytes(
+                                xor_base[i..i + 8].try_into().unwrap(),
+                            );
+                            let x = d ^ b;
+                            if x != 0 {
+                                is_zero = false;
+                            }
+                            xored[i..i + 8].copy_from_slice(&x.to_ne_bytes());
                         }
 
+                        // Phase 6b: skip blocks identical to XOR base
+                        // (XOR result is all-zeros → block unchanged vs base)
+                        if is_zero {
+                            self.delta_hashes[global_sub_idx] = hash;
+                            // Still save RAW block for next P-frame base
+                            new_prev_blocks
+                                .insert(sub_idx as u32, block.to_vec());
+                            global_sub_idx += 1;
+                            continue;
+                        }
+
+                        block_data.extend_from_slice(&xored);
                         indices.push(sub_idx as u32);
                         self.delta_hashes[global_sub_idx] = hash;
+
+                        // Track frame type per block for logging
+                        if self
+                            .prev_checkpoint_blocks
+                            .contains_key(&(sub_idx as u32))
+                        {
+                            p_frame_blocks += 1;
+                        } else {
+                            i_frame_blocks += 1;
+                        }
+
+                        // Save RAW block (before XOR) for next checkpoint
+                        new_prev_blocks
+                            .insert(sub_idx as u32, block.to_vec());
                     }
                     global_sub_idx += 1;
                 }
             }
         }
+
+        // Determine frame type: P-frame if we had previous blocks to XOR against
+        let is_p_frame = has_prev;
 
         // Step 3: Pack into packed_v1 format
         let block_count = indices.len() as u32;
@@ -1154,10 +1204,40 @@ impl Vmm {
             VmmError::InternalError(format!("lz4 compress finish: {e}"))
         })?;
 
+        // Step 5: Update prev_checkpoint_blocks for next P-frame.
+        // Cap at 4096 blocks (16MB) — if exceeded, clear so next becomes I-frame.
+        const MAX_PREV_BLOCKS: usize = 4096;
+        if new_prev_blocks.len() <= MAX_PREV_BLOCKS {
+            self.prev_checkpoint_blocks = new_prev_blocks;
+        } else {
+            info!(
+                "get_dirty_delta_packed: prev_blocks cap exceeded \
+                 ({} > {}), clearing — next checkpoint will be I-frame",
+                new_prev_blocks.len(),
+                MAX_PREV_BLOCKS
+            );
+            self.prev_checkpoint_blocks.clear();
+        }
+
+        info!(
+            "get_dirty_delta_packed: frame={}, {} blocks \
+             ({} P-frame + {} I-frame), {}B raw, {}B compressed, \
+             prev_blocks: {} → {}",
+            if is_p_frame { "P" } else { "I" },
+            block_count,
+            p_frame_blocks,
+            i_frame_blocks,
+            raw_size,
+            compressed.len(),
+            prev_block_count,
+            self.prev_checkpoint_blocks.len()
+        );
+
         Ok(DirtyDeltaPacked {
             blob: compressed,
             block_count,
             raw_size: raw_size as u64,
+            is_p_frame,
         })
     }
 

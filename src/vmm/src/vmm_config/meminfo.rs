@@ -53,4 +53,7 @@ pub struct DirtyDeltaPacked {
     pub block_count: u32,
     /// Uncompressed size of the packed_v1 blob in bytes.
     pub raw_size: u64,
+    /// True if this is a P-frame (XOR'd against previous checkpoint).
+    /// False for I-frame (XOR'd against golden base).
+    pub is_p_frame: bool,
 }

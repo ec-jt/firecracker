@@ -20,7 +20,18 @@ where
         Some("kvm-dirty") => Ok(ParsedRequest::new_sync(VmmAction::GetKvmDirty)),
         Some("kvm-dirty-writes") => Ok(ParsedRequest::new_sync(VmmAction::GetKvmDirtyWrites)),
         Some("dirty-delta") => Ok(ParsedRequest::new_sync(VmmAction::GetDirtyDelta)),
-        Some("dirty-delta-packed") => Ok(ParsedRequest::new_sync(VmmAction::GetDirtyDeltaPacked)),
+        Some("dirty-delta-packed") => match path_tokens.next() {
+            Some("keyframe") => Ok(ParsedRequest::new_sync(
+                VmmAction::GetDirtyDeltaPacked { keyframe: true },
+            )),
+            None => Ok(ParsedRequest::new_sync(
+                VmmAction::GetDirtyDeltaPacked { keyframe: false },
+            )),
+            Some(unknown) => Err(RequestError::InvalidPathMethod(
+                format!("/memory/dirty-delta-packed/{}", unknown),
+                Method::Get,
+            )),
+        },
         Some(unknown_path) => Err(RequestError::InvalidPathMethod(
             format!("/memory/{}", unknown_path),
             Method::Get,

@@ -163,8 +163,12 @@ pub enum VmmAction {
     InitDeltaHashes(String),
     /// Get dirty delta: xxHash dedup at 4KB granularity
     GetDirtyDelta,
-    /// Get dirty delta as XOR'd packed lz4 blob (single-call checkpoint export)
-    GetDirtyDeltaPacked,
+    /// Get dirty delta as XOR'd packed lz4 blob (single-call checkpoint export).
+    /// `keyframe`: if true, clears prev_checkpoint_blocks before export (forces I-frame).
+    GetDirtyDeltaPacked {
+        /// Force I-frame by clearing previous checkpoint blocks.
+        keyframe: bool,
+    },
     /// Get dirty block bitmap for a drive.
     GetDriveDirty(String),
     /// Get dirty block bitmap for a drive and reset it.
@@ -538,7 +542,7 @@ impl<'a> PrebootApiController<'a> {
             | GetKvmDirty
             | GetKvmDirtyWrites
             | GetDirtyDelta
-            | GetDirtyDeltaPacked
+            | GetDirtyDeltaPacked { .. }
             | GetDriveDirty(_)
             | GetAndResetDriveDirty(_)
             | InitDeltaHashes(_) => Err(VmmActionError::OperationNotSupportedPreBoot),
@@ -872,12 +876,22 @@ impl RuntimeApiController {
                     }
                 }
             }
-            GetDirtyDeltaPacked => {
+            GetDirtyDeltaPacked { keyframe } => {
                 let start_us = get_time_us(ClockType::Monotonic);
                 let mut vmm = self.vmm.lock().expect("Poisoned lock");
                 if vmm.instance_info.state != VmState::Paused {
                     error!("'get dirty delta packed' called while VM is running");
                     return Err(VmmActionError::OperationNotSupportedWhileRunning);
+                }
+                // Force I-frame: clear previous checkpoint blocks so all blocks
+                // XOR against golden instead of previous checkpoint.
+                if keyframe {
+                    let prev_count = vmm.prev_checkpoint_blocks.len();
+                    vmm.prev_checkpoint_blocks.clear();
+                    info!(
+                        "'get dirty delta packed' KEYFRAME: cleared {prev_count} \
+                         prev_checkpoint_blocks"
+                    );
                 }
                 let page_size = vmm.page_size;
                 match vmm.get_dirty_delta_packed(page_size) {
@@ -885,8 +899,9 @@ impl RuntimeApiController {
                         let elapsed = get_time_us(ClockType::Monotonic) - start_us;
                         info!(
                             "'get dirty delta packed' took {elapsed} us \
-                             ({} blocks, {}B raw, {}B compressed)",
-                            packed.block_count, packed.raw_size, packed.blob.len()
+                             ({} blocks, {}B raw, {}B compressed, frame={})",
+                            packed.block_count, packed.raw_size, packed.blob.len(),
+                            if packed.is_p_frame { "P" } else { "I" }
                         );
                         Ok(VmmData::DirtyDeltaPacked(packed))
                     }

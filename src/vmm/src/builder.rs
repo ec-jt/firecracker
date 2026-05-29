@@ -3,6 +3,7 @@
 
 //! Enables pre-boot setup, instantiation and booting of a Firecracker VMM.
 
+use std::collections::HashMap;
 use std::fmt::Debug;
 use std::io;
 #[cfg(feature = "gdb")]
@@ -321,6 +322,7 @@ pub fn build_microvm_for_boot(
         page_size: vm_resources.machine_config.huge_pages.page_size(),
         delta_hashes: vec![],
         golden_base: None,
+        prev_checkpoint_blocks: HashMap::new(),
     };
     let vmm = Arc::new(Mutex::new(vmm));
 
@@ -530,6 +532,7 @@ pub fn build_microvm_from_snapshot(
         page_size: vm_resources.machine_config.huge_pages.page_size(),
         delta_hashes: vec![],
         golden_base: None,
+        prev_checkpoint_blocks: HashMap::new(),
     };
 
     // Move vcpus to their own threads and start their state machine in the 'Paused' state.
@@ -852,6 +855,7 @@ pub(crate) mod tests {
             page_size: host_page_size(),
             delta_hashes: vec![],
             golden_base: None,
+            prev_checkpoint_blocks: HashMap::new(),
         }
     }
 

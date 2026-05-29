@@ -251,15 +251,20 @@ impl ParsedRequest {
                 VmmData::MemoryDirty(dirty) => Self::success_response_with_data(dirty),
                 VmmData::DriveDirtyBitmap(dirty) => Self::success_response_with_data(dirty),
                 VmmData::DirtyDeltaPacked(packed) => {
-                    // Binary response: 8-byte envelope + lz4 blob
-                    // [block_count: u32 LE][raw_size: u32 LE][lz4 blob...]
+                    // Binary response: 9-byte envelope + lz4 blob
+                    // [block_count: u32 LE][raw_size: u32 LE][flags: u8][lz4 blob...]
+                    // flags bit 0: 0=I-frame (XOR vs golden), 1=P-frame (XOR vs prev)
+                    let flags: u8 = if packed.is_p_frame { 1 } else { 0 };
                     info!(
-                        "DirtyDeltaPacked response: {} blocks, {} raw, {} compressed",
-                        packed.block_count, packed.raw_size, packed.blob.len()
+                        "DirtyDeltaPacked response: {} blocks, {} raw, {} compressed, \
+                         frame={}, flags=0x{:02x}",
+                        packed.block_count, packed.raw_size, packed.blob.len(),
+                        if packed.is_p_frame { "P" } else { "I" }, flags
                     );
-                    let mut body_bytes = Vec::with_capacity(8 + packed.blob.len());
+                    let mut body_bytes = Vec::with_capacity(9 + packed.blob.len());
                     body_bytes.extend_from_slice(&packed.block_count.to_le_bytes());
                     body_bytes.extend_from_slice(&(packed.raw_size as u32).to_le_bytes());
+                    body_bytes.push(flags);
                     body_bytes.extend_from_slice(&packed.blob);
                     let mut response = Response::new(Version::Http11, StatusCode::OK);
                     response.set_body(Body::new(body_bytes));
