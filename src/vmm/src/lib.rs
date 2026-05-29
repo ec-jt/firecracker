@@ -1073,6 +1073,9 @@ impl Vmm {
         let mut new_prev_blocks: HashMap<u32, Vec<u8>> = HashMap::new();
         let mut p_frame_blocks = 0u32;
         let mut i_frame_blocks = 0u32;
+        // Per-block XOR base bitmap: bit=1 → XOR'd against prev, bit=0 → golden.
+        // Used by C handler to determine correct decode base during restore.
+        let mut xor_base_bits: Vec<bool> = Vec::new();
 
         for mem_slot in self
             .vm
@@ -1152,11 +1155,12 @@ impl Vmm {
                         indices.push(sub_idx as u32);
                         self.delta_hashes[global_sub_idx] = hash;
 
-                        // Track frame type per block for logging
-                        if self
+                        // Track XOR base per block for the bitmap
+                        let used_prev = self
                             .prev_checkpoint_blocks
-                            .contains_key(&(sub_idx as u32))
-                        {
+                            .contains_key(&(sub_idx as u32));
+                        xor_base_bits.push(used_prev);
+                        if used_prev {
                             p_frame_blocks += 1;
                         } else {
                             i_frame_blocks += 1;
@@ -1174,20 +1178,33 @@ impl Vmm {
         // Determine frame type: P-frame if we had previous blocks to XOR against
         let is_p_frame = has_prev;
 
-        // Step 3: Pack into packed_v1 format
+        // Step 3: Pack into packed_v2 format (with XOR base bitmap)
         let block_count = indices.len() as u32;
         let block_size = host_ps as u32;
+
+        // Build XOR base bitmap: bit=1 → XOR'd against prev, bit=0 → golden.
+        // Placed after header, before index table.
+        let bitmap_bytes = (block_count as usize + 7) / 8;
+        let mut xor_bitmap = vec![0u8; bitmap_bytes];
+        for (i, &used_prev) in xor_base_bits.iter().enumerate() {
+            if used_prev {
+                xor_bitmap[i / 8] |= 1 << (i % 8);
+            }
+        }
+
         let raw_size =
-            20 + (block_count as usize) * 4 + block_data.len();
+            20 + bitmap_bytes + (block_count as usize) * 4 + block_data.len();
         let mut raw_blob = Vec::with_capacity(raw_size);
 
-        // Header (20 bytes): magic "FCBK", version u16=1, block_size u32,
+        // Header (20 bytes): magic "FCBK", version u16=2, block_size u32,
         // block_count u32, reserved 6 bytes
         raw_blob.extend_from_slice(b"FCBK");
-        raw_blob.extend_from_slice(&1u16.to_le_bytes());
+        raw_blob.extend_from_slice(&2u16.to_le_bytes());  // version 2
         raw_blob.extend_from_slice(&block_size.to_le_bytes());
         raw_blob.extend_from_slice(&block_count.to_le_bytes());
         raw_blob.extend_from_slice(&[0u8; 6]);
+        // XOR base bitmap (version 2): ceil(block_count/8) bytes
+        raw_blob.extend_from_slice(&xor_bitmap);
         // Index table
         for idx in &indices {
             raw_blob.extend_from_slice(&idx.to_le_bytes());
