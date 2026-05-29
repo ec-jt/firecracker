@@ -250,6 +250,21 @@ impl ParsedRequest {
                 VmmData::Memory(meminfo) => Self::success_response_with_data(meminfo),
                 VmmData::MemoryDirty(dirty) => Self::success_response_with_data(dirty),
                 VmmData::DriveDirtyBitmap(dirty) => Self::success_response_with_data(dirty),
+                VmmData::DirtyDeltaPacked(packed) => {
+                    // Binary response: 8-byte envelope + lz4 blob
+                    // [block_count: u32 LE][raw_size: u32 LE][lz4 blob...]
+                    info!(
+                        "DirtyDeltaPacked response: {} blocks, {} raw, {} compressed",
+                        packed.block_count, packed.raw_size, packed.blob.len()
+                    );
+                    let mut body_bytes = Vec::with_capacity(8 + packed.blob.len());
+                    body_bytes.extend_from_slice(&packed.block_count.to_le_bytes());
+                    body_bytes.extend_from_slice(&(packed.raw_size as u32).to_le_bytes());
+                    body_bytes.extend_from_slice(&packed.blob);
+                    let mut response = Response::new(Version::Http11, StatusCode::OK);
+                    response.set_body(Body::new(body_bytes));
+                    response
+                }
             },
             Err(vmm_action_error) => {
                 let mut response = match vmm_action_error {

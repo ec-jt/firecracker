@@ -148,6 +148,7 @@ use crate::persist::{GuestRegionUffdMapping, MicrovmState, MicrovmStateError, Vm
 use crate::rate_limiter::BucketUpdate;
 use crate::utils::usize_to_u64;
 use crate::vmm_config::instance_info::{InstanceInfo, VmState};
+use crate::vmm_config::meminfo::DirtyDeltaPacked;
 use crate::vstate::memory::{GuestMemory, GuestMemoryMmap, GuestMemoryRegion};
 use crate::vstate::vcpu::VcpuState;
 pub use crate::vstate::vcpu::{Vcpu, VcpuConfig, VcpuEvent, VcpuHandle, VcpuResponse};
@@ -325,7 +326,16 @@ pub struct Vmm {
     /// Initialized from golden mem.snap via PUT /memory/delta-hashes/init.
     /// Updated on each GET /memory/dirty-delta call.
     delta_hashes: Vec<u64>,
+    /// Golden mem.snap mmap for XOR delta compression.
+    /// Kept alive after init_delta_hashes() for use by get_dirty_delta_packed().
+    /// (ptr, len) — raw mmap, PROT_READ, MAP_SHARED.
+    golden_base: Option<(*const u8, usize)>,
 }
+
+// SAFETY: golden_base is a read-only mmap pointer that is only accessed
+// from the VMM thread while the VM is paused.  The pointer is valid for
+// the lifetime of the Vmm (cleaned up in Drop).
+unsafe impl Send for Vmm {}
 
 impl Vmm {
     /// Gets Vmm version.
@@ -916,10 +926,18 @@ impl Vmm {
             hashes.push(xxh3_64(block));
         }
 
-        unsafe { libc::munmap(ptr, len); }
+        // Keep the golden mmap alive for XOR delta compression in
+        // get_dirty_delta_packed().  Cleaned up in Drop.
+        // SAFETY: ptr is a valid mmap pointer with PROT_READ, MAP_SHARED.
+        // We only read from it while the VM is paused.
+        if let Some((old_ptr, old_len)) = self.golden_base.take() {
+            // Clean up any previous mmap (e.g. re-init after golden upgrade)
+            unsafe { libc::munmap(old_ptr as *mut libc::c_void, old_len); }
+        }
+        self.golden_base = Some((ptr as *const u8, len));
 
         info!(
-            "init_delta_hashes: computed {} xxh3 hashes from {} ({}MB)",
+            "init_delta_hashes: computed {} xxh3 hashes from {} ({}MB), golden mmap kept alive",
             num_blocks, golden_path, len / (1024 * 1024)
         );
         self.delta_hashes = hashes;
@@ -992,6 +1010,145 @@ impl Vmm {
         }
 
         Ok(delta_bitmap)
+    }
+
+    /// Get dirty delta as XOR'd packed_v1 lz4 blob.
+    ///
+    /// Combines get_dirty_delta() bitmap + block reads + XOR with golden base
+    /// + pack into packed_v1 format + lz4 compress — all in a single call.
+    /// Returns the compressed blob ready for S3 upload.
+    ///
+    /// Must be called while VM is paused.
+    pub fn get_dirty_delta_packed(
+        &mut self,
+        page_size: usize,
+    ) -> Result<DirtyDeltaPacked, VmmError> {
+        use lz4_flex::frame::FrameEncoder;
+        use std::io::Write;
+        use xxhash_rust::xxh3::xxh3_64;
+
+        if self.delta_hashes.is_empty() {
+            return Err(VmmError::InternalError(
+                "delta_hashes not initialized — call init_delta_hashes first".into(),
+            ));
+        }
+        let (golden_ptr, golden_len) = self.golden_base.ok_or_else(|| {
+            VmmError::InternalError("golden_base not available for XOR".into())
+        })?;
+        // SAFETY: golden_ptr/golden_len were set by a successful mmap in
+        // init_delta_hashes().  The mmap is PROT_READ, MAP_SHARED and stays
+        // valid until Drop.  We only read from it while the VM is paused.
+        let golden_data = unsafe {
+            std::slice::from_raw_parts(golden_ptr, golden_len)
+        };
+
+        let host_ps = crate::arch::host_page_size(); // 4096
+        let subs_per_page = page_size / host_ps;
+
+        // Step 1: Get UFFD dirty bitmap (hugepage granularity)
+        let dirty_bitmap = self.get_dirty_memory(page_size)?;
+
+        // Step 2: For each dirty block, read + xxHash dedup + XOR with golden
+        let mut indices: Vec<u32> = Vec::new();
+        let mut block_data: Vec<u8> = Vec::new();
+        let mut global_sub_idx = 0usize;
+
+        for mem_slot in self
+            .vm
+            .guest_memory()
+            .iter()
+            .flat_map(|region| region.plugged_slots())
+        {
+            let base = mem_slot.slice.ptr_guard_mut().as_ptr() as *const u8;
+            let nr_pages = mem_slot.slice.len() / page_size;
+
+            for page_idx in 0..nr_pages {
+                let is_dirty =
+                    (dirty_bitmap[page_idx / 64] & (1u64 << (page_idx % 64))) != 0;
+                if !is_dirty {
+                    global_sub_idx += subs_per_page;
+                    continue;
+                }
+
+                for sub in 0..subs_per_page {
+                    let sub_idx = page_idx * subs_per_page + sub;
+                    let offset = sub_idx * host_ps;
+                    // SAFETY: base points to guest memory mapped by KVM.
+                    // offset is within the slot's bounds (sub_idx < nr_subs).
+                    // VM is paused so memory is stable.
+                    let block = unsafe {
+                        std::slice::from_raw_parts(base.add(offset), host_ps)
+                    };
+                    let hash = xxh3_64(block);
+
+                    if global_sub_idx < self.delta_hashes.len()
+                        && hash != self.delta_hashes[global_sub_idx]
+                    {
+                        // Changed block — XOR with golden base
+                        if offset + host_ps <= golden_len {
+                            let golden_block =
+                                &golden_data[offset..offset + host_ps];
+                            let mut xored = vec![0u8; host_ps];
+                            // XOR in 8-byte chunks for performance
+                            for i in (0..host_ps).step_by(8) {
+                                let d = u64::from_ne_bytes(
+                                    block[i..i + 8].try_into().unwrap(),
+                                );
+                                let g = u64::from_ne_bytes(
+                                    golden_block[i..i + 8].try_into().unwrap(),
+                                );
+                                xored[i..i + 8]
+                                    .copy_from_slice(&(d ^ g).to_ne_bytes());
+                            }
+                            block_data.extend_from_slice(&xored);
+                        } else {
+                            // Block beyond golden range — store raw
+                            block_data.extend_from_slice(block);
+                        }
+
+                        indices.push(sub_idx as u32);
+                        self.delta_hashes[global_sub_idx] = hash;
+                    }
+                    global_sub_idx += 1;
+                }
+            }
+        }
+
+        // Step 3: Pack into packed_v1 format
+        let block_count = indices.len() as u32;
+        let block_size = host_ps as u32;
+        let raw_size =
+            20 + (block_count as usize) * 4 + block_data.len();
+        let mut raw_blob = Vec::with_capacity(raw_size);
+
+        // Header (20 bytes): magic "FCBK", version u16=1, block_size u32,
+        // block_count u32, reserved 6 bytes
+        raw_blob.extend_from_slice(b"FCBK");
+        raw_blob.extend_from_slice(&1u16.to_le_bytes());
+        raw_blob.extend_from_slice(&block_size.to_le_bytes());
+        raw_blob.extend_from_slice(&block_count.to_le_bytes());
+        raw_blob.extend_from_slice(&[0u8; 6]);
+        // Index table
+        for idx in &indices {
+            raw_blob.extend_from_slice(&idx.to_le_bytes());
+        }
+        // Block data
+        raw_blob.extend_from_slice(&block_data);
+
+        // Step 4: lz4 frame compress (compatible with Python lz4.frame.decompress)
+        let mut encoder = FrameEncoder::new(Vec::new());
+        encoder.write_all(&raw_blob).map_err(|e| {
+            VmmError::InternalError(format!("lz4 compress write: {e}"))
+        })?;
+        let compressed = encoder.finish().map_err(|e| {
+            VmmError::InternalError(format!("lz4 compress finish: {e}"))
+        })?;
+
+        Ok(DirtyDeltaPacked {
+            blob: compressed,
+            block_count,
+            raw_size: raw_size as u64,
+        })
     }
 
     /// Get true guest writes: KVM dirty log ∩ UFFD pagemap dirty.
@@ -1118,6 +1275,12 @@ impl Drop for Vmm {
         // Write the metrics before exiting.
         if let Err(err) = METRICS.write() {
             error!("Failed to write metrics while stopping: {}", err);
+        }
+
+        // Clean up golden mmap if it was kept alive for XOR delta compression.
+        if let Some((ptr, len)) = self.golden_base.take() {
+            // SAFETY: ptr/len were set by a successful mmap in init_delta_hashes().
+            unsafe { libc::munmap(ptr as *mut libc::c_void, len); }
         }
 
         if !self.vcpus_handles.is_empty() {

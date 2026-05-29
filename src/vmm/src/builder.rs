@@ -320,6 +320,7 @@ pub fn build_microvm_for_boot(
         device_manager,
         page_size: vm_resources.machine_config.huge_pages.page_size(),
         delta_hashes: vec![],
+        golden_base: None,
     };
     let vmm = Arc::new(Mutex::new(vmm));
 
@@ -528,6 +529,7 @@ pub fn build_microvm_from_snapshot(
         device_manager,
         page_size: vm_resources.machine_config.huge_pages.page_size(),
         delta_hashes: vec![],
+        golden_base: None,
     };
 
     // Move vcpus to their own threads and start their state machine in the 'Paused' state.
@@ -849,6 +851,7 @@ pub(crate) mod tests {
             device_manager: default_device_manager(),
             page_size: host_page_size(),
             delta_hashes: vec![],
+            golden_base: None,
         }
     }
 

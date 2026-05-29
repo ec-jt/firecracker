@@ -30,7 +30,7 @@ use crate::vmm_config::drive::{BlockDeviceConfig, BlockDeviceUpdateConfig, Drive
 use crate::vmm_config::entropy::{EntropyDeviceConfig, EntropyDeviceError};
 use crate::vmm_config::instance_info::{InstanceInfo, VmState};
 use crate::vmm_config::machine_config::{MachineConfig, MachineConfigError, MachineConfigUpdate};
-use crate::vmm_config::meminfo::{DriveDirty, MemoryDirty, MemoryMapingsResponse, MemoryResponse};
+use crate::vmm_config::meminfo::{DirtyDeltaPacked, DriveDirty, MemoryDirty, MemoryMapingsResponse, MemoryResponse};
 use crate::vmm_config::memory_hotplug::{
     MemoryHotplugConfig, MemoryHotplugConfigError, MemoryHotplugSizeUpdate,
 };
@@ -163,6 +163,8 @@ pub enum VmmAction {
     InitDeltaHashes(String),
     /// Get dirty delta: xxHash dedup at 4KB granularity
     GetDirtyDelta,
+    /// Get dirty delta as XOR'd packed lz4 blob (single-call checkpoint export)
+    GetDirtyDeltaPacked,
     /// Get dirty block bitmap for a drive.
     GetDriveDirty(String),
     /// Get dirty block bitmap for a drive and reset it.
@@ -259,6 +261,8 @@ pub enum VmmData {
     MemoryDirty(MemoryDirty),
     /// Drive dirty block bitmap
     DriveDirtyBitmap(DriveDirty),
+    /// XOR'd packed lz4 blob for dirty delta memory export
+    DirtyDeltaPacked(DirtyDeltaPacked),
 }
 
 /// Trait used for deduplicating the MMDS request handling across the two ApiControllers.
@@ -534,6 +538,7 @@ impl<'a> PrebootApiController<'a> {
             | GetKvmDirty
             | GetKvmDirtyWrites
             | GetDirtyDelta
+            | GetDirtyDeltaPacked
             | GetDriveDirty(_)
             | GetAndResetDriveDirty(_)
             | InitDeltaHashes(_) => Err(VmmActionError::OperationNotSupportedPreBoot),
@@ -862,6 +867,33 @@ impl RuntimeApiController {
                         let elapsed = get_time_us(ClockType::Monotonic) - start_us;
                         error!(
                             "'get dirty delta' FAILED after {elapsed} us: {e:?}"
+                        );
+                        Err(VmmActionError::InternalVmm(e))
+                    }
+                }
+            }
+            GetDirtyDeltaPacked => {
+                let start_us = get_time_us(ClockType::Monotonic);
+                let mut vmm = self.vmm.lock().expect("Poisoned lock");
+                if vmm.instance_info.state != VmState::Paused {
+                    error!("'get dirty delta packed' called while VM is running");
+                    return Err(VmmActionError::OperationNotSupportedWhileRunning);
+                }
+                let page_size = vmm.page_size;
+                match vmm.get_dirty_delta_packed(page_size) {
+                    Ok(packed) => {
+                        let elapsed = get_time_us(ClockType::Monotonic) - start_us;
+                        info!(
+                            "'get dirty delta packed' took {elapsed} us \
+                             ({} blocks, {}B raw, {}B compressed)",
+                            packed.block_count, packed.raw_size, packed.blob.len()
+                        );
+                        Ok(VmmData::DirtyDeltaPacked(packed))
+                    }
+                    Err(e) => {
+                        let elapsed = get_time_us(ClockType::Monotonic) - start_us;
+                        error!(
+                            "'get dirty delta packed' FAILED after {elapsed} us: {e:?}"
                         );
                         Err(VmmActionError::InternalVmm(e))
                     }

@@ -40,3 +40,17 @@ pub struct DriveDirty {
     /// Number of dirty blocks
     pub dirty_count: u64,
 }
+
+/// XOR'd packed_v1 lz4 blob for dirty delta memory export.
+///
+/// Contains the compressed packed_v1 blob ready for S3 upload,
+/// plus metadata for the 8-byte envelope.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct DirtyDeltaPacked {
+    /// lz4 frame-compressed packed_v1 blob (XOR'd blocks).
+    pub blob: Vec<u8>,
+    /// Number of dirty blocks in the blob.
+    pub block_count: u32,
+    /// Uncompressed size of the packed_v1 blob in bytes.
+    pub raw_size: u64,
+}
