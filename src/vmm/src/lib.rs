@@ -1125,7 +1125,6 @@ impl Vmm {
 
                         // XOR in 8-byte chunks for performance
                         let mut xored = vec![0u8; host_ps];
-                        let mut is_zero = true;
                         for i in (0..host_ps).step_by(8) {
                             let d = u64::from_ne_bytes(
                                 block[i..i + 8].try_into().unwrap(),
@@ -1134,22 +1133,19 @@ impl Vmm {
                                 xor_base[i..i + 8].try_into().unwrap(),
                             );
                             let x = d ^ b;
-                            if x != 0 {
-                                is_zero = false;
-                            }
                             xored[i..i + 8].copy_from_slice(&x.to_ne_bytes());
                         }
 
-                        // Phase 6b: skip blocks identical to XOR base
-                        // (XOR result is all-zeros → block unchanged vs base)
-                        if is_zero {
-                            self.delta_hashes[global_sub_idx] = hash;
-                            // Still save RAW block for next P-frame base
-                            new_prev_blocks
-                                .insert(sub_idx as u32, block.to_vec());
-                            global_sub_idx += 1;
-                            continue;
-                        }
+                        // NOTE: blocks whose XOR result is all-zeros MUST
+                        // still be exported (the old "Phase 6b" skip caused
+                        // guest memory corruption).  A block exported with a
+                        // non-golden value in an earlier version can later
+                        // revert to exact golden content; if that revert is
+                        // skipped, chain restore layers the STALE earlier
+                        // value while the vmstate expects golden content —
+                        // observed as "kernel BUG at lib/list_debug.c" list
+                        // corruption after restore.  All-zero blocks are
+                        // nearly free anyway: lz4 collapses them.
 
                         block_data.extend_from_slice(&xored);
                         indices.push(sub_idx as u32);
